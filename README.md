@@ -19,14 +19,17 @@
 ## Architecture
 
 ```text
-clients
-  | put/delete
-  v
-write queue -----> single writer thread -----> append + fsync WAL -----> mutate shard map
-  ^
-  | get
-  |
-reader threads -----> hash(key) -> shard -> shared read lock -> in-memory map lookup
+                           scaling view
+
+readers scale out horizontally                     writes stay serialized
+
+reader 1 ----\
+reader 2 -----+--> hash(key) --> shard[0..63] --> shared read lock --> in-memory map
+reader 3 -----+
+...           +
+reader N ----/
+
+writer clients --> write queue --> 1 writer thread --> append + fsync WAL --> mutate shard
 ```
 
 ## WAL format
@@ -114,4 +117,12 @@ Example result from a local run on this machine:
 
 ```text
 seconds=3 readers=4 keyspace=1024 reads=13034931 writes=16754 reads_per_sec=4344977.00 writes_per_sec=5584.67
+```
+
+Benchmark machine:
+
+```text
+macOS 15.6.1
+arm64
+Darwin kernel RELEASE_ARM64_T6020
 ```
