@@ -1,5 +1,5 @@
-const std = @import("std");
+const impl = @import("src/main.zig");
 
-pub fn main(init: std.process.Init) !void {
-    try std.Io.File.stdout().writeStreamingAll(init.io, "Hello, World!\n");
+pub fn main(init: @import("std").process.Init) !void {
+    try impl.main(init);
 }
