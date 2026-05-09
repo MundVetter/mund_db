@@ -3,8 +3,9 @@
 `mund_db` is a small persistent key-value store with:
 
 - a single dedicated writer thread
-- concurrent readers through shard-level read locks
+- concurrent readers
 - an in-memory hashmap rebuilt from a WAL on startup
+- two selectable backends: `rwlock` and `cow`
 - a CLI, REPL, tests, and a simple benchmark
 
 ## Layout
@@ -12,22 +13,25 @@
 - `src/main.zig`: thin entrypoint
 - `src/cli.zig`: CLI commands and REPL
 - `src/bench.zig`: benchmark runner
-- `src/db.zig`: core database, sharded map, writer queue
+- `src/db.zig`: backend selector and shared `KvDb` wrapper
+- `src/db_rwlock.zig`: baseline sharded RW-lock backend
+- `src/db_cow.zig`: copy-on-write snapshot backend
 - `src/wal.zig`: WAL encoding/decoding and checksums
 - `src/types.zig`: shared record types and constants
 
 ## Architecture
 
 ```text
-                           scaling view
+                         scaling view
 
 readers scale out horizontally                     writes stay serialized
 
 reader 1 ----\
-reader 2 -----+--> hash(key) --> shard[0..63] --> shared read lock --> in-memory map
-reader 3 -----+
-...           +
-reader N ----/
+reader 2 -----+--> hash(key) --> shard[0..63] --> backend read path --> in-memory state
+reader 3 -----+                                              |
+...           +                                              +--> `rwlock`: shared shard lock
+reader N ----/                                               |
+                                                             +--> `cow`: pinned immutable snapshot
 
 writer clients --> write queue --> 1 writer thread --> append + fsync WAL --> mutate shard
 ```
@@ -61,13 +65,18 @@ Replay behavior:
 
 ## Concurrency model
 
-Readers never touch the WAL. They hash the key, take a shared lock on exactly one shard, and read from that shard's map.
+Readers never touch the WAL. They hash the key and only touch one shard.
+
+Backend choices:
+
+- `rwlock`: each shard is a mutable hashmap behind a shared/exclusive lock
+- `cow`: each shard publishes immutable snapshots so readers avoid shard locks
 
 Writes are serialized by a background writer thread. Each write:
 
 1. enters the queue
 2. gets appended to the WAL and synced
-3. updates the target shard in memory
+3. updates the target shard in memory with the selected backend
 4. wakes the caller
 
 That keeps acknowledged writes durable and consistent with crash recovery.
@@ -86,6 +95,7 @@ Set the WAL path once:
 
 ```bash
 export MUND_DB_WAL=data.wal
+export MUND_DB_BACKEND=rwlock   # or cow
 ```
 
 Then use the CLI:
@@ -100,11 +110,21 @@ zig build run -- repl
 
 ## Benchmark
 
-This starts one write-driving client and `n` read-driving clients against the database's single internal writer thread.
+There are two useful benchmark modes:
+
+- `bench` / `bench-scale`: one synchronous writer client plus `n` reader clients
+- `bench-read` / `bench-read-scale`: readers only, no writer pressure
 
 ```bash
 export MUND_DB_WAL=bench.wal
+export MUND_DB_BACKEND=cow
 zig build run -- bench 5 8 4096
+zig build run -- bench-scale 3 1024 1 2 4 8 16
+zig build run -- bench-read-scale 3 1024 1 2 4 8 16
+
+python3 -m venv /private/tmp/mund_db_venv
+/private/tmp/mund_db_venv/bin/pip install seaborn pandas matplotlib
+/private/tmp/mund_db_venv/bin/python scripts/plot_bench.py
 ```
 
 Arguments:
@@ -113,11 +133,59 @@ Arguments:
 - `8`: reader threads
 - `4096`: keyspace size
 
-Example result from a local run on this machine:
+Current mixed scaling comparison:
 
 ```text
-seconds=3 readers=4 keyspace=1024 reads=13034931 writes=16754 reads_per_sec=4344977.00 writes_per_sec=5584.67
+rwlock, mixed, 3s, keyspace=1024
+readers | reads/sec | writes/sec
+1       | 26164459  | 32775
+2       | 19389437  | 29455
+4       | 25857619  | 30806
+8       | 33119237  |  6681
+16      | 37310442  | 25275
+
+cow, mixed, 3s, keyspace=1024
+readers | reads/sec | writes/sec
+1       |  50751729 | 31628
+2       |  51854376 | 28788
+4       | 105202139 | 29303
+8       |  94967858 |  9768
+16      | 131045194 | 28239
 ```
+
+Current read-only scaling comparison:
+
+```text
+rwlock, read_only, 3s, keyspace=1024
+readers | reads/sec
+1       | 30269270
+2       | 36240243
+4       | 28465457
+8       | 32033749
+16      | 39374694
+
+cow, read_only, 3s, keyspace=1024
+readers | reads/sec
+1       |  59987189
+2       | 102221856
+4       |  90633360
+8       |  78816760
+16      | 140649071
+```
+
+Takeaway:
+
+- `cow` is materially faster than `rwlock` for the current benchmark harness
+- `cow` gives much higher read throughput under both read-only and mixed load
+- writes are still serialized by design, so write throughput does not scale horizontally
+
+Mixed workload graph:
+
+![Mixed benchmark graph](docs/assets/benchmark-mixed.svg)
+
+Read-only graph:
+
+![Read-only benchmark graph](docs/assets/benchmark-read-only.svg)
 
 Benchmark machine:
 
